@@ -1,0 +1,5 @@
+google-api-python-client
+pandas
+openpyxl
+isodate
+python-dotenv
