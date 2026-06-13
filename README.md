@@ -211,7 +211,9 @@ Use `--force` on any stage to refresh all rows.
 | `--output`, `-o` | Output file (default: `<input>_Transcripts` with same extension) |
 | `--force`, `-f` | Re-fetch transcripts for all rows |
 | `--language`, `-l` | Preferred languages, comma-separated (default: `en,en-US,en-GB`) |
-| `--delay` | Seconds between requests (default: `0.75`) |
+| `--delay` | Seconds between requests (default: `2.5`) |
+| `--max-videos` | Limit how many videos to fetch this run (batching) |
+| `--continue-on-ip-block` | Keep going after IP rate-limit errors (default: stop early) |
 
 ### extract_transcript_urls.py
 
@@ -246,7 +248,7 @@ Use `--force` on any stage to refresh all rows.
 |--------|----------------|
 | `Full Video Transcript` | Plain text, all caption segments joined |
 | `Transcript Language` | `en`, `en (auto-generated)` |
-| `Transcript Status` | `ok`, `no_captions`, `unavailable`, `error` |
+| `Transcript Status` | `ok`, `no_captions`, `unavailable`, `ip_blocked`, `error` |
 
 ### Stage 3 — transcript URLs
 
@@ -346,10 +348,26 @@ The video has no available captions. The transcript and URL columns will be left
 
 ### Transcript fetching is slow or fails with rate-limit errors
 
-Increase the delay between requests:
+YouTube blocked your IP after too many requests. The script now:
+
+- Saves progress after **each video** to `<input>_Transcripts.xlsx`
+- Stops early after consecutive `ip_blocked` errors (use `--continue-on-ip-block` to override)
+- Resumes automatically from the output file on the next run
+
+**What to do:**
+
+1. Stop the current run (Ctrl+C) if it is still going
+2. Wait **30–60 minutes**
+3. Re-run the same command — it will skip videos already fetched:
 
 ```bash
-python fetch_transcripts.py -i "AL-ML Playlist_Enriched.xlsx" --delay 2.0
+python fetch_transcripts.py -i "AL-ML Playlist_Enriched.xlsx" --delay 3
+```
+
+For large playlists, fetch in batches:
+
+```bash
+python fetch_transcripts.py -i "AL-ML Playlist_Enriched.xlsx" --max-videos 30 --delay 3
 ```
 
 ### CSV looks malformed in Excel
