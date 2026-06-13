@@ -1,7 +1,7 @@
 import argparse
-import os
 import sys
 import time
+from datetime import datetime
 
 try:
     from youtube_transcript_api import YouTubeTranscriptApi
@@ -24,14 +24,15 @@ from pipeline_cli import add_db_args, add_playlist_args, maybe_export, open_db, 
 from playlist_utils import TRANSCRIPT_COLUMN, TRANSCRIPT_LANGUAGE_COLUMN, TRANSCRIPT_STATUS_COLUMN
 
 DEFAULT_LANGUAGES = ["en", "en-US", "en-GB"]
-MAX_RETRIES = 3
-RETRY_BASE_DELAY_SEC = 2
+TRANSIENT_MAX_RETRIES = 5
+TRANSIENT_BASE_DELAY_SEC = 2
 DEFAULT_DELAY_SEC = 2.5
-IP_BLOCK_RETRY_DELAY_SEC = 30
-CONSECUTIVE_IP_BLOCK_LIMIT = 2
+DEFAULT_INITIAL_IP_BACKOFF_SEC = 30
+DEFAULT_MAX_IP_BACKOFF_SEC = 30 * 60
 
 TRANSIENT_ERRORS = (YouTubeRequestFailed,)
 IP_BLOCK_ERRORS = (IpBlocked, RequestBlocked)
+PERMANENT_FAILURE_STATUSES = {"no_captions", "unavailable", "error"}
 
 
 def parse_languages(language_arg):
@@ -62,6 +63,22 @@ def format_error(exc):
     return f"{type(exc).__name__}: {exc}"
 
 
+def format_delay(seconds):
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, secs = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {secs}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes}m {secs}s"
+
+
+def log(message):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {message}", flush=True)
+
+
 def empty_result(status):
     return {
         TRANSCRIPT_COLUMN: "",
@@ -70,45 +87,53 @@ def empty_result(status):
     }
 
 
-def fetch_transcript_for_video(api, video_id, languages):
-    last_error = None
-    for attempt in range(MAX_RETRIES):
+def fetch_transcript_for_video(api, video_id, languages, ip_backoff_sec, max_ip_backoff_sec):
+    transient_attempt = 0
+
+    while True:
         try:
             fetched = api.fetch(video_id, languages=languages)
             text = " ".join(snippet.text.strip() for snippet in fetched.snippets if snippet.text)
-            return {
-                TRANSCRIPT_COLUMN: text,
-                TRANSCRIPT_LANGUAGE_COLUMN: format_transcript_language(fetched),
-                TRANSCRIPT_STATUS_COLUMN: "ok",
-            }
+            return (
+                {
+                    TRANSCRIPT_COLUMN: text,
+                    TRANSCRIPT_LANGUAGE_COLUMN: format_transcript_language(fetched),
+                    TRANSCRIPT_STATUS_COLUMN: "ok",
+                },
+                DEFAULT_INITIAL_IP_BACKOFF_SEC,
+            )
         except (NoTranscriptFound, TranscriptsDisabled):
-            return empty_result("no_captions")
+            return empty_result("no_captions"), ip_backoff_sec
         except (VideoUnavailable, VideoUnplayable, AgeRestricted):
-            return empty_result("unavailable")
+            return empty_result("unavailable"), ip_backoff_sec
         except TRANSIENT_ERRORS + IP_BLOCK_ERRORS + (CouldNotRetrieveTranscript,) as exc:
-            last_error = exc
             if is_ip_block_error(exc):
-                if attempt < MAX_RETRIES - 1:
-                    print(
-                        f"  IP rate limit for {video_id}. "
-                        f"Waiting {IP_BLOCK_RETRY_DELAY_SEC}s before retry..."
-                    )
-                    time.sleep(IP_BLOCK_RETRY_DELAY_SEC)
-                    continue
-                return empty_result("ip_blocked")
+                wait_sec = min(ip_backoff_sec, max_ip_backoff_sec)
+                log(
+                    f"IP rate limit for {video_id}. "
+                    f"Waiting {format_delay(wait_sec)} before retry "
+                    f"(next backoff up to {format_delay(min(wait_sec * 2, max_ip_backoff_sec))})..."
+                )
+                time.sleep(wait_sec)
+                ip_backoff_sec = min(max(ip_backoff_sec * 2, DEFAULT_INITIAL_IP_BACKOFF_SEC), max_ip_backoff_sec)
+                transient_attempt = 0
+                continue
 
-            if attempt < MAX_RETRIES - 1:
-                delay = RETRY_BASE_DELAY_SEC * (2 ** attempt)
-                print(f"  Transient error for {video_id} ({format_error(exc)}). Retrying in {delay}s...")
+            transient_attempt += 1
+            if transient_attempt < TRANSIENT_MAX_RETRIES:
+                delay = TRANSIENT_BASE_DELAY_SEC * (2 ** (transient_attempt - 1))
+                log(
+                    f"Transient error for {video_id} ({format_error(exc)}). "
+                    f"Retrying in {format_delay(delay)} ({transient_attempt}/{TRANSIENT_MAX_RETRIES - 1})..."
+                )
                 time.sleep(delay)
                 continue
-            return empty_result("error")
-        except Exception as exc:
-            print(f"  Unexpected error for {video_id}: {format_error(exc)}")
-            return empty_result("error")
 
-    print(f"  Failed to fetch transcript for {video_id}: {format_error(last_error)}")
-    return empty_result("error")
+            log(f"Giving up on {video_id} after transient errors: {format_error(exc)}")
+            return empty_result("error"), ip_backoff_sec
+        except Exception as exc:
+            log(f"Unexpected error for {video_id}: {format_error(exc)}")
+            return empty_result("error"), ip_backoff_sec
 
 
 def fetch_transcripts(
@@ -118,8 +143,9 @@ def fetch_transcripts(
     languages=None,
     delay_sec=DEFAULT_DELAY_SEC,
     max_videos=None,
-    stop_on_ip_block=True,
     export_path=None,
+    initial_ip_backoff_sec=DEFAULT_INITIAL_IP_BACKOFF_SEC,
+    max_ip_backoff_sec=DEFAULT_MAX_IP_BACKOFF_SEC,
 ):
     validate_playlist_arg(playlist_name, required=True)
     languages = languages or DEFAULT_LANGUAGES
@@ -128,56 +154,69 @@ def fetch_transcripts(
         if not db.get_playlist_by_name(playlist_name):
             raise ValueError(f"Playlist not found in database: {playlist_name}")
 
-        videos = db.get_videos_needing_transcripts(playlist_name=playlist_name, force=force)
-        if max_videos is not None:
-            videos = videos[:max_videos]
+        ip_backoff_sec = initial_ip_backoff_sec
+        status_counts = {}
+        processed = 0
 
-        if not videos:
-            print("No videos need transcript fetching.")
-        else:
-            api = YouTubeTranscriptApi()
+        log(
+            f"Starting overnight-safe transcript fetch for '{playlist_name}'. "
+            f"IP backoff: {format_delay(initial_ip_backoff_sec)} -> {format_delay(max_ip_backoff_sec)}. "
+            "The process will keep retrying and will not exit on rate limits."
+        )
+
+        while True:
+            videos = db.get_videos_needing_transcripts(playlist_name=playlist_name, force=force)
+            if max_videos is not None:
+                remaining = max(0, max_videos - processed)
+                videos = videos[:remaining]
+
+            if not videos:
+                log("No more videos need transcript fetching.")
+                break
+
             total = len(videos)
-            status_counts = {}
-            consecutive_ip_blocks = 0
-            stopped_early = False
+            log(f"Work queue: {total} video(s) needing transcripts.")
 
-            print(f"Fetching transcripts for {total} unique videos...")
             for index, video in enumerate(videos, start=1):
                 video_id = video["video_id"]
-                print(f"  [{index}/{total}] {video_id}")
-                result = fetch_transcript_for_video(api, video_id, languages)
+                log(f"[{index}/{total}] Fetching {video_id}")
+
+                result, ip_backoff_sec = fetch_transcript_for_video(
+                    YouTubeTranscriptApi(),
+                    video_id,
+                    languages,
+                    ip_backoff_sec,
+                    max_ip_backoff_sec,
+                )
                 db.upsert_video_transcript(video_id, result)
 
                 status = result[TRANSCRIPT_STATUS_COLUMN]
                 status_counts[status] = status_counts.get(status, 0) + 1
+                processed += 1
 
-                if status == "ip_blocked":
-                    consecutive_ip_blocks += 1
-                    if stop_on_ip_block and consecutive_ip_blocks >= CONSECUTIVE_IP_BLOCK_LIMIT:
-                        print(
-                            f"\nStopping early after {consecutive_ip_blocks} consecutive IP rate-limit errors. "
-                            "Progress saved to database. "
-                            "Wait 30-60 minutes, then re-run the same command to resume."
-                        )
-                        stopped_early = True
-                        break
+                if status in PERMANENT_FAILURE_STATUSES or status == "ok":
+                    if delay_sec > 0:
+                        time.sleep(delay_sec)
                 else:
-                    consecutive_ip_blocks = 0
+                    time.sleep(min(delay_sec, 5))
 
-                if index < total and delay_sec > 0:
-                    time.sleep(delay_sec)
+            if max_videos is not None and processed >= max_videos:
+                log(f"Reached --max-videos limit ({max_videos}).")
+                break
 
-            if status_counts:
-                summary = ", ".join(
-                    f"{count} {status}" for status, count in sorted(status_counts.items())
-                )
-                print(f"\nTranscript status summary: {summary}")
-            if stopped_early:
-                print("Partial transcript results saved to database.")
+            pending = len(db.get_videos_needing_transcripts(playlist_name=playlist_name, force=force))
+            if pending == 0:
+                break
+
+            log(f"{pending} video(s) still pending. Refreshing work queue...")
+
+        if status_counts:
+            summary = ", ".join(f"{count} {status}" for status, count in sorted(status_counts.items()))
+            log(f"Run status summary: {summary}")
 
         summary = db.get_pipeline_summary(playlist_name)
-        print(
-            f"\nTranscript pipeline for '{playlist_name}': "
+        log(
+            f"Transcript pipeline for '{playlist_name}': "
             f"{summary.get('transcript_ok', 0)} ok, "
             f"{summary.get('no_captions', 0)} no_captions, "
             f"{summary.get('unavailable', 0)} unavailable, "
@@ -194,7 +233,8 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description=(
             "Fetch YouTube video transcripts for videos in a database playlist. "
-            "Uses youtube-transcript-api (no API key required)."
+            "Uses youtube-transcript-api (no API key required). "
+            "Retries indefinitely on IP rate limits with exponential backoff."
         )
     )
     add_playlist_args(parser, required=True)
@@ -214,18 +254,25 @@ def parse_args():
         "--delay",
         type=float,
         default=DEFAULT_DELAY_SEC,
-        help=f"Seconds to wait between transcript requests (default: {DEFAULT_DELAY_SEC})",
+        help=f"Seconds to wait between successful transcript requests (default: {DEFAULT_DELAY_SEC})",
     )
     parser.add_argument(
         "--max-videos",
         type=int,
         default=None,
-        help="Maximum number of videos to fetch this run (useful for batching)",
+        help="Maximum number of videos to fetch this run (default: no limit)",
     )
     parser.add_argument(
-        "--continue-on-ip-block",
-        action="store_true",
-        help="Keep going after IP rate-limit errors instead of stopping early",
+        "--initial-ip-backoff",
+        type=float,
+        default=DEFAULT_INITIAL_IP_BACKOFF_SEC,
+        help=f"Initial IP rate-limit backoff in seconds (default: {DEFAULT_INITIAL_IP_BACKOFF_SEC})",
+    )
+    parser.add_argument(
+        "--max-ip-backoff",
+        type=float,
+        default=DEFAULT_MAX_IP_BACKOFF_SEC,
+        help=f"Maximum IP rate-limit backoff in seconds (default: {DEFAULT_MAX_IP_BACKOFF_SEC})",
     )
     add_db_args(parser)
     parse_export_arg(parser)
@@ -243,8 +290,9 @@ if __name__ == "__main__":
             languages=parse_languages(args.language),
             delay_sec=args.delay,
             max_videos=args.max_videos,
-            stop_on_ip_block=not args.continue_on_ip_block,
             export_path=args.export,
+            initial_ip_backoff_sec=args.initial_ip_backoff,
+            max_ip_backoff_sec=args.max_ip_backoff,
         )
     except ValueError as exc:
         print(exc)
