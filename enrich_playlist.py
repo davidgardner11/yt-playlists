@@ -1,12 +1,8 @@
 import argparse
-import csv
 import os
-import re
 import sys
 import time
 from pathlib import Path
-
-import pandas as pd
 
 try:
     from dotenv import load_dotenv
@@ -16,18 +12,24 @@ try:
 except ImportError:
     print(
         "Please install required packages: "
-        "pip install google-api-python-client pandas openpyxl isodate python-dotenv"
+        "pip install -r requirements.txt"
     )
     sys.exit(1)
+
+from playlist_utils import (
+    URLS_COLUMN,
+    default_output_path,
+    extract_urls,
+    get_video_id,
+    read_playlist,
+    require_video_url_column,
+    validate_playlist_paths,
+    write_playlist,
+)
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
 DEFAULT_INPUT = "AL-ML Playlist.xlsx"
-SUPPORTED_EXTENSIONS = {".xlsx", ".csv"}
-URLS_COLUMN = (
-    "All websites links and URLs listed in the description or other video meta data "
-    "(comma-separated)"
-)
 ENRICHED_COLUMNS = [
     "Channel Name",
     "Channel ID",
@@ -40,25 +42,9 @@ ENRICHED_COLUMNS = [
     "Tags/Keywords",
     URLS_COLUMN,
 ]
-VIDEO_ID_PATTERNS = [
-    r"(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/"
-    r"|youtube\.com/v/|youtube\.com/shorts/)([0-9A-Za-z_-]{11})",
-    r"(?:v=|\/)([0-9A-Za-z_-]{11})",
-]
-HTTP_URL_PATTERN = re.compile(r"https?://[^\s<>\"'\[\]()]+", re.IGNORECASE)
 BATCH_SIZE = 50
 MAX_RETRIES = 5
 RETRY_BASE_DELAY_SEC = 2
-
-
-def get_video_id(url):
-    if not isinstance(url, str) or not url.strip():
-        return None
-    for pattern in VIDEO_ID_PATTERNS:
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
-    return None
 
 
 def format_duration(raw_duration):
@@ -74,20 +60,6 @@ def format_duration(raw_duration):
         return f"{minutes}:{seconds:02d}"
     except Exception:
         return raw_duration
-
-
-def extract_urls(*texts):
-    found = []
-    seen = set()
-    for text in texts:
-        if not isinstance(text, str) or not text.strip():
-            continue
-        for match in HTTP_URL_PATTERN.findall(text):
-            url = match.rstrip(".,;)")
-            if url not in seen:
-                seen.add(url)
-                found.append(url)
-    return ", ".join(found)
 
 
 def row_is_enriched(row):
@@ -158,88 +130,6 @@ def fetch_metadata_for_ids(youtube, video_ids):
     return metadata_map
 
 
-CSV_OUTPUT_DELIMITER = "\t"
-
-
-def detect_csv_delimiter(path):
-    with open(path, encoding="utf-8-sig", newline="") as handle:
-        sample = handle.read(8192)
-    try:
-        dialect = csv.Sniffer().sniff(sample, delimiters="\t,")
-        return dialect.delimiter
-    except csv.Error:
-        if "\t" in sample.splitlines()[0]:
-            return "\t"
-        return ","
-
-
-def normalize_columns(df):
-    df.columns = df.columns.astype(str).str.strip()
-    return df
-
-
-def require_video_url_column(df):
-    if "Video URL" in df.columns:
-        return
-    columns = ", ".join(df.columns.astype(str))
-    raise ValueError(
-        "Missing required column 'Video URL'. "
-        f"Found columns: {columns}"
-    )
-
-
-def prepare_df_for_csv_export(df):
-    export_df = df.copy()
-    for column in export_df.select_dtypes(include="object").columns:
-        export_df[column] = export_df[column].map(sanitize_csv_cell)
-    return export_df
-
-
-def sanitize_csv_cell(value):
-    if pd.isna(value):
-        return value
-    text = str(value)
-    return text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ").strip()
-
-
-def read_playlist(path):
-    ext = Path(path).suffix.lower()
-    if ext == ".xlsx":
-        return normalize_columns(pd.read_excel(path))
-    if ext == ".csv":
-        delimiter = detect_csv_delimiter(path)
-        df = pd.read_csv(path, sep=delimiter, encoding="utf-8-sig")
-        df = normalize_columns(df)
-        df.attrs["csv_delimiter"] = delimiter
-        return df
-    supported = ", ".join(sorted(SUPPORTED_EXTENSIONS))
-    raise ValueError(f"Unsupported input format '{ext}'. Supported formats: {supported}")
-
-
-def write_playlist(df, path):
-    ext = Path(path).suffix.lower()
-    if ext == ".xlsx":
-        df.to_excel(path, index=False)
-    elif ext == ".csv":
-        export_df = prepare_df_for_csv_export(df)
-        export_df.to_csv(
-            path,
-            sep=CSV_OUTPUT_DELIMITER,
-            index=False,
-            encoding="utf-8-sig",
-            quoting=csv.QUOTE_ALL,
-            lineterminator="\n",
-        )
-    else:
-        supported = ", ".join(sorted(SUPPORTED_EXTENSIONS))
-        raise ValueError(f"Unsupported output format '{ext}'. Supported formats: {supported}")
-
-
-def default_output_path(input_path):
-    path = Path(input_path)
-    return str(path.with_name(f"{path.stem}_Enriched{path.suffix}"))
-
-
 def apply_metadata(df, metadata_map):
     for column in ENRICHED_COLUMNS:
         if column not in df.columns:
@@ -294,7 +184,7 @@ def fetch_youtube_metadata(input_path, api_key, output_path=None, force=False):
     df.drop(columns=["video_id"], inplace=True)
 
     if output_path is None:
-        output_path = default_output_path(input_path)
+        output_path = default_output_path(input_path, "Enriched")
 
     write_playlist(df, output_path)
     print(f"\nSuccess! Enriched playlist saved as: {output_path}")
@@ -344,20 +234,8 @@ if __name__ == "__main__":
         print(f"Input file not found: {args.input}")
         sys.exit(1)
 
-    input_ext = Path(args.input).suffix.lower()
-    if input_ext not in SUPPORTED_EXTENSIONS:
-        supported = ", ".join(sorted(SUPPORTED_EXTENSIONS))
-        print(f"Unsupported input format '{input_ext}'. Supported formats: {supported}")
-        sys.exit(1)
-
-    if args.output:
-        output_ext = Path(args.output).suffix.lower()
-        if output_ext not in SUPPORTED_EXTENSIONS:
-            supported = ", ".join(sorted(SUPPORTED_EXTENSIONS))
-            print(f"Unsupported output format '{output_ext}'. Supported formats: {supported}")
-            sys.exit(1)
-
     try:
+        validate_playlist_paths(args.input, args.output)
         fetch_youtube_metadata(
             args.input,
             api_key,

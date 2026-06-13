@@ -3,3 +3,4 @@ pandas
 openpyxl
 isodate
 python-dotenv
+youtube-transcript-api

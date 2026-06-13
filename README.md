@@ -1,29 +1,66 @@
 # YouTube Playlist Enricher
 
-A Python script that enriches a playlist of YouTube videos with metadata from the [YouTube Data API v3](https://developers.google.com/youtube/v3). It reads video URLs from an Excel (`.xlsx`) or CSV (`.csv`) file, fetches channel info, statistics, descriptions, tags, and extracted links, then writes an enriched copy of the file.
+A Python toolkit that enriches a playlist of YouTube videos in three stages:
+
+1. **Metadata** — channel info, statistics, descriptions, tags (`enrich_playlist.py`)
+2. **Transcripts** — full video captions (`fetch_transcripts.py`)
+3. **URL extraction** — websites mentioned in transcripts (`extract_transcript_urls.py`)
+
+It reads video URLs from an Excel (`.xlsx`) or CSV (`.csv`) file and writes enriched output in the same format.
 
 ## What it does
 
-Given a playlist file with YouTube video URLs, `enrich_playlist.py` will:
+```mermaid
+flowchart LR
+    input[Playlist file] --> enrich[enrich_playlist.py]
+    enrich --> enriched[Enriched file]
+    enriched --> transcripts[fetch_transcripts.py]
+    transcripts --> withTranscripts[File + transcripts]
+    withTranscripts --> urls[extract_transcript_urls.py]
+    urls --> final[File + transcript URLs]
+```
+
+### Stage 1: Metadata enrichment
+
+`enrich_playlist.py` will:
 
 1. Extract video IDs from each URL
-2. Fetch metadata from the YouTube API (in batches of 50)
+2. Fetch metadata from the YouTube Data API (in batches of 50)
 3. Add enriched columns to your playlist
 4. Save the result as a new file (by default, `<input>_Enriched` with the same extension)
 
-The script deduplicates video IDs before calling the API, skips rows that are already enriched, retries on rate-limit errors, and warns about missing or unparseable videos.
+### Stage 2: Transcript fetching
+
+`fetch_transcripts.py` will:
+
+1. Fetch captions for each video via `youtube-transcript-api` (no API key required)
+2. Add the full transcript text and status columns
+3. Save back to the input file by default (or a custom output path)
+
+### Stage 3: Transcript URL extraction
+
+`extract_transcript_urls.py` will:
+
+1. Scan each transcript for `http://`, `https://`, and `www.` URLs
+2. Add a transcript URL column and an optional combined URL column
+3. Save back to the input file by default (offline, no API calls)
+
+All scripts deduplicate video IDs where applicable, support incremental re-runs, and skip already-populated rows unless `--force` is used.
 
 ## Prerequisites
 
 - Python 3.10+ (tested with 3.14)
-- A Google Cloud project with the **YouTube Data API v3** enabled
-- A YouTube Data API key
+- A Google Cloud project with the **YouTube Data API v3** enabled (stage 1 only)
+- A YouTube Data API key (stage 1 only)
 
 ## Project files
 
 | File | Purpose |
 |------|---------|
-| `enrich_playlist.py` | Main enrichment script |
+| `enrich_playlist.py` | Stage 1 — metadata enrichment via YouTube Data API |
+| `fetch_transcripts.py` | Stage 2 — transcript fetching via youtube-transcript-api |
+| `extract_transcript_urls.py` | Stage 3 — URL extraction from transcripts |
+| `playlist_utils.py` | Shared I/O, video ID parsing, and URL extraction helpers |
 | `requirements.txt` | Python dependencies |
 | `.env.example` | Template for API key configuration |
 | `.env` | Your local API key (not committed to git) |
@@ -51,7 +88,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 4. Get a YouTube Data API key
+### 4. Get a YouTube Data API key (stage 1 only)
 
 1. Go to the [Google Cloud Console](https://console.cloud.google.com/)
 2. Create or select a project
@@ -73,11 +110,11 @@ Edit `.env`:
 YOUTUBE_API_KEY=your-youtube-data-api-v3-key-here
 ```
 
-> **Note:** `.env` is listed in `.gitignore` and should never be committed. Only `.env.example` is tracked in git.
+> **Note:** `.env` is listed in `.gitignore` and should never be committed. Only `.env.example` is tracked in git. Stages 2 and 3 do not use this key.
 
 ## Input file format
 
-The script accepts **Excel (`.xlsx`)** or **CSV (`.csv`)** files. The only required column is **`Video URL`**.
+The scripts accept **Excel (`.xlsx`)** or **CSV (`.csv`)** files. The only required column is **`Video URL`**.
 
 A minimal two-column file works:
 
@@ -86,7 +123,7 @@ A minimal two-column file works:
 | `Video Title` | No | Existing title (preserved as-is) |
 | `Video URL` | **Yes** | YouTube link for each video |
 
-Any other columns in your input file are preserved unchanged. The script also adds the enriched columns listed below.
+Any other columns in your input file are preserved unchanged.
 
 ### CSV input notes
 
@@ -103,77 +140,92 @@ Any other columns in your input file are preserved unchanged. The script also ad
 
 ## Usage
 
-### Basic run
+### Full 3-step pipeline
 
-Enriches the default input file and writes `AL-ML Playlist_Enriched.xlsx`:
+```bash
+# Step 1: metadata (requires YOUTUBE_API_KEY in .env)
+python enrich_playlist.py -i "AL-ML Playlist.xlsx"
+
+# Step 2: transcripts (no API key required)
+python fetch_transcripts.py -i "AL-ML Playlist_Enriched.xlsx"
+
+# Step 3: extract URLs from transcripts (offline)
+python extract_transcript_urls.py -i "AL-ML Playlist_Enriched_Transcripts.xlsx"
+```
+
+Stages 2 and 3 write new files by default (`<input>_Transcripts` and `<input>_TranscriptURLs`). Use `-o` to specify a custom output path.
+
+### Stage 1: Metadata enrichment
 
 ```bash
 python enrich_playlist.py
-```
-
-Or with the virtual environment explicitly:
-
-```bash
-.venv/bin/python enrich_playlist.py
-```
-
-### Specify input and output files
-
-```bash
-python enrich_playlist.py --input "AL-ML Playlist.xlsx" --output "AL-ML Playlist_Enriched.xlsx"
-```
-
-Short flags:
-
-```bash
 python enrich_playlist.py -i "AL-ML Playlist.xlsx" -o "AL-ML Playlist_Enriched.xlsx"
-```
-
-### CSV input
-
-```bash
-python enrich_playlist.py -i "AL-ML Playlist.csv"
-```
-
-This writes `AL-ML Playlist_Enriched.csv` by default.
-
-### Cross-format conversion
-
-You can read one format and write another:
-
-```bash
 python enrich_playlist.py -i "AL-ML Playlist.csv" -o "AL-ML Playlist_Enriched.xlsx"
-```
-
-### Re-fetch all rows
-
-By default, rows that already have a `Channel Name` are skipped. Use `--force` to refresh everything:
-
-```bash
 python enrich_playlist.py --force
 ```
 
-### Incremental enrichment
-
-To add metadata for new videos only, run against an already-enriched file:
+### Stage 2: Transcript fetching
 
 ```bash
-python enrich_playlist.py -i "AL-ML Playlist_Enriched.xlsx"
+python fetch_transcripts.py -i "AL-ML Playlist_Enriched.xlsx"
+python fetch_transcripts.py -i "AL-ML Playlist_Enriched.xlsx" --force
+python fetch_transcripts.py -i "AL-ML Playlist_Enriched.xlsx" --language en,es --delay 1.0
 ```
 
-New rows without a `Channel Name` will be fetched; existing enriched rows are left unchanged.
+### Stage 3: Transcript URL extraction
+
+```bash
+python extract_transcript_urls.py -i "AL-ML Playlist_Enriched.xlsx"
+python extract_transcript_urls.py -i "AL-ML Playlist_Enriched.xlsx" --exclude-youtube
+python extract_transcript_urls.py -i "AL-ML Playlist_Enriched.xlsx" --force
+```
+
+### Incremental updates
+
+Each stage skips rows that are already populated:
+
+```bash
+# Add new videos to the enriched file, then:
+python enrich_playlist.py -i "AL-ML Playlist_Enriched.xlsx"
+python fetch_transcripts.py -i "AL-ML Playlist_Enriched.xlsx"
+python extract_transcript_urls.py -i "AL-ML Playlist_Enriched_Transcripts.xlsx"
+```
+
+Use `--force` on any stage to refresh all rows.
 
 ## CLI reference
 
+### enrich_playlist.py
+
 | Flag | Description |
 |------|-------------|
-| `--input`, `-i` | Input playlist file (`.xlsx` or `.csv`; default: `AL-ML Playlist.xlsx`) |
+| `--input`, `-i` | Input playlist file (default: `AL-ML Playlist.xlsx`) |
 | `--output`, `-o` | Output file (default: `<input>_Enriched` with same extension) |
-| `--force`, `-f` | Re-fetch metadata for all rows, even if already enriched |
+| `--force`, `-f` | Re-fetch metadata for all rows |
+
+### fetch_transcripts.py
+
+| Flag | Description |
+|------|-------------|
+| `--input`, `-i` | Input playlist file (default: `AL-ML Playlist_Enriched.xlsx`) |
+| `--output`, `-o` | Output file (default: `<input>_Transcripts` with same extension) |
+| `--force`, `-f` | Re-fetch transcripts for all rows |
+| `--language`, `-l` | Preferred languages, comma-separated (default: `en,en-US,en-GB`) |
+| `--delay` | Seconds between requests (default: `0.75`) |
+
+### extract_transcript_urls.py
+
+| Flag | Description |
+|------|-------------|
+| `--input`, `-i` | Input file with transcripts (default: `AL-ML Playlist_Enriched_Transcripts.xlsx`) |
+| `--output`, `-o` | Output file (default: `<input>_TranscriptURLs` with same extension) |
+| `--force`, `-f` | Re-extract URLs for all rows |
+| `--exclude-youtube` | Omit youtube.com / youtu.be links |
+| `--no-combined-column` | Skip the combined `All URLs (description + transcript)` column |
 
 ## Output columns
 
-The script adds (or updates) these columns:
+### Stage 1 — metadata
 
 | Column | Source |
 |--------|--------|
@@ -186,13 +238,28 @@ The script adds (or updates) these columns:
 | `Comment Count` | Total comments |
 | `Full Video Description` | Full video description text |
 | `Tags/Keywords` | Comma-separated video tags |
-| `All websites links and URLs listed in the description or other video meta data (comma-separated)` | URLs extracted from description and tags |
+| `All websites links and URLs listed in the description or other video meta data (comma-separated)` | URLs from description and tags |
+
+### Stage 2 — transcripts
+
+| Column | Example values |
+|--------|----------------|
+| `Full Video Transcript` | Plain text, all caption segments joined |
+| `Transcript Language` | `en`, `en (auto-generated)` |
+| `Transcript Status` | `ok`, `no_captions`, `unavailable`, `error` |
+
+### Stage 3 — transcript URLs
+
+| Column | Content |
+|--------|---------|
+| `URLs from Transcript (comma-separated)` | URLs found in the transcript |
+| `All URLs (description + transcript)` | Merged, deduplicated URLs from description + transcript |
 
 ## Output format notes
 
 ### Excel (`.xlsx`)
 
-Best choice for viewing and editing in Excel. Descriptions, tags, and URLs are preserved with original line breaks.
+Best choice for viewing and editing in Excel. Descriptions, transcripts, and URLs preserve original line breaks.
 
 ### CSV (`.csv`)
 
@@ -202,7 +269,21 @@ CSV output is written in an Excel-friendly format:
 - **All fields quoted**
 - **Embedded newlines replaced with spaces** in text fields
 
-This avoids the column-splitting problems that occur when descriptions contain commas or line breaks.
+Use `.xlsx` output when working with long transcripts.
+
+## Transcript limitations
+
+- Transcripts are fetched via the unofficial `youtube-transcript-api` library, not the official YouTube Data API
+- Only videos with captions (manual or auto-generated) return transcript text
+- Videos without captions get `Transcript Status = no_captions` and a blank transcript
+- Making too many requests too quickly may trigger IP-based rate limiting; use `--delay` to slow down
+- Private, age-restricted, or unavailable videos get `Transcript Status = unavailable`
+
+## API quota (stage 1 only)
+
+The YouTube Data API has a default daily quota of **10,000 units**. A `videos.list` call costs **1 unit** per request and can fetch up to 50 videos per call.
+
+For a playlist of ~150 videos with ~75 unique IDs, expect roughly **2 API calls** — well within the free daily limit.
 
 ## Example workflow
 
@@ -214,35 +295,27 @@ pip install -r requirements.txt
 cp .env.example .env
 # Edit .env with your API key
 
-# Enrich the playlist (Excel)
-python enrich_playlist.py
+# Run the full pipeline
+python enrich_playlist.py -i "AL-ML Playlist.xlsx"
+python fetch_transcripts.py -i "AL-ML Playlist_Enriched.xlsx"
+python extract_transcript_urls.py -i "AL-ML Playlist_Enriched_Transcripts.xlsx"
 
-# Or start from CSV
-python enrich_playlist.py -i "AL-ML Playlist.csv"
-
-# Write Excel output from CSV input
-python enrich_playlist.py -i "AL-ML Playlist.csv" -o "AL-ML Playlist_Enriched.xlsx"
-
-# Later: add new videos and enrich only the new rows
+# Later: add new videos and update incrementally
 python enrich_playlist.py -i "AL-ML Playlist_Enriched.xlsx"
+python fetch_transcripts.py -i "AL-ML Playlist_Enriched.xlsx"
+python extract_transcript_urls.py -i "AL-ML Playlist_Enriched_Transcripts.xlsx"
 
-# Refresh all metadata (e.g. updated view counts)
+# Refresh all metadata and transcripts
 python enrich_playlist.py -i "AL-ML Playlist_Enriched.xlsx" --force
+python fetch_transcripts.py -i "AL-ML Playlist_Enriched.xlsx" --force
+python extract_transcript_urls.py -i "AL-ML Playlist_Enriched_Transcripts.xlsx" --force
 ```
-
-## API quota
-
-The YouTube Data API has a default daily quota of **10,000 units**. A `videos.list` call costs **1 unit** per request and can fetch up to 50 videos per call.
-
-For a playlist of ~150 videos with ~75 unique IDs, expect roughly **2 API calls** — well within the free daily limit.
-
-If you hit quota limits, the script will automatically retry with exponential backoff. If retries are exhausted, wait until your quota resets (midnight Pacific Time) or request a quota increase in Google Cloud Console.
 
 ## Troubleshooting
 
 ### `Missing API key`
 
-Ensure `.env` exists in the project root and contains:
+Only stage 1 requires an API key. Ensure `.env` exists and contains:
 
 ```env
 YOUTUBE_API_KEY=your-key-here
@@ -250,11 +323,9 @@ YOUTUBE_API_KEY=your-key-here
 
 ### `Input file not found`
 
-Check the file path passed to `--input`, or confirm `AL-ML Playlist.xlsx` exists in the project directory.
+Check the file path passed to `--input`.
 
 ### `Please install required packages`
-
-Activate the virtual environment and install dependencies:
 
 ```bash
 source .venv/bin/activate
@@ -263,29 +334,27 @@ pip install -r requirements.txt
 
 ### `Missing required column 'Video URL'`
 
-Your input file must include a column named exactly `Video URL`. A two-column file with `Video Title` and `Video URL` is sufficient.
+Your input file must include a column named exactly `Video URL`.
 
-### `Unsupported input format` / `Unsupported output format`
+### `Missing required column 'Full Video Transcript'`
 
-Only `.xlsx` and `.csv` are supported. Check the file extension passed to `--input` or `--output`.
+Run `fetch_transcripts.py` before `extract_transcript_urls.py`.
 
-### Warnings about unparseable URLs
+### Transcript status `no_captions`
 
-The script prints the spreadsheet row numbers for any `Video URL` values it cannot parse. Fix those URLs and re-run.
+The video has no available captions. The transcript and URL columns will be left blank.
 
-### Warnings about missing videos
+### Transcript fetching is slow or fails with rate-limit errors
 
-Videos that are deleted, private, or unavailable will not be returned by the API. Those rows are left with empty enriched columns. The script lists the affected video IDs and row numbers.
+Increase the delay between requests:
+
+```bash
+python fetch_transcripts.py -i "AL-ML Playlist_Enriched.xlsx" --delay 2.0
+```
 
 ### CSV looks malformed in Excel
 
-Re-run the script to regenerate the enriched CSV, or write Excel output instead:
-
-```bash
-python enrich_playlist.py -i "AL-ML Playlist.csv" -o "AL-ML Playlist_Enriched.xlsx"
-```
-
-Older comma-delimited enriched CSV files with multiline descriptions may split across columns in Excel. The current script writes tab-delimited, quoted CSV output to prevent this.
+Re-run with `.xlsx` output, or regenerate the CSV with the current scripts (tab-delimited, quoted output).
 
 ### Empty like counts
 
