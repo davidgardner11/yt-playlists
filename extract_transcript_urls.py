@@ -1,132 +1,79 @@
 import argparse
-import os
 import sys
 
-from playlist_utils import (
-    ALL_URLS_COLUMN,
-    TRANSCRIPT_COLUMN,
-    TRANSCRIPT_STATUS_COLUMN,
-    TRANSCRIPT_URLS_COLUMN,
-    URLS_COLUMN,
-    cell_has_value,
-    default_output_path,
-    extract_urls,
-    merge_url_columns,
-    read_playlist,
-    require_column,
-    validate_playlist_paths,
-    write_playlist,
-)
-
-DEFAULT_INPUT = "AL-ML Playlist_Enriched_Transcripts.xlsx"
-
-
-def row_has_transcript_urls(row):
-    return cell_has_value(row.get(TRANSCRIPT_URLS_COLUMN, ""))
-
-
-def transcript_is_usable(row):
-    status = row.get(TRANSCRIPT_STATUS_COLUMN, "")
-    if isinstance(status, str) and status.strip() and status.strip() != "ok":
-        return False
-    return cell_has_value(row.get(TRANSCRIPT_COLUMN, ""))
+from pipeline_cli import add_db_args, add_playlist_args, maybe_export, open_db, parse_export_arg, validate_playlist_arg
+from playlist_utils import extract_urls, merge_url_columns
 
 
 def extract_transcript_urls(
-    input_path,
-    output_path=None,
+    playlist_name,
+    db_path=None,
     force=False,
     include_youtube=True,
-    add_combined_column=True,
+    export_path=None,
 ):
-    df = read_playlist(input_path)
-    require_column(df, TRANSCRIPT_COLUMN)
+    validate_playlist_arg(playlist_name, required=True)
 
-    if TRANSCRIPT_URLS_COLUMN not in df.columns:
-        df[TRANSCRIPT_URLS_COLUMN] = ""
-    if add_combined_column and ALL_URLS_COLUMN not in df.columns:
-        df[ALL_URLS_COLUMN] = ""
+    with open_db(db_path) as db:
+        if not db.get_playlist_by_name(playlist_name):
+            raise ValueError(f"Playlist not found in database: {playlist_name}")
 
-    updated = 0
-    for idx, row in df.iterrows():
-        if not force and row_has_transcript_urls(row):
-            continue
-        if not transcript_is_usable(row):
-            continue
+        videos = db.get_videos_needing_url_extraction(playlist_name=playlist_name, force=force)
+        updated = 0
 
-        transcript = row.get(TRANSCRIPT_COLUMN, "")
-        urls = extract_urls(transcript, include_youtube=include_youtube)
-        df.at[idx, TRANSCRIPT_URLS_COLUMN] = urls
+        for video in videos:
+            transcript = video.get("transcript_text", "")
+            if not transcript:
+                continue
 
-        if add_combined_column:
-            description_urls = row.get(URLS_COLUMN, "")
-            df.at[idx, ALL_URLS_COLUMN] = merge_url_columns(description_urls, urls)
+            transcript_urls = extract_urls(transcript, include_youtube=include_youtube)
+            all_urls = merge_url_columns(video.get("description_urls", ""), transcript_urls)
+            db.upsert_video_urls(video["video_id"], transcript_urls, all_urls)
+            updated += 1
 
-        updated += 1
+        print(f"Extracted URLs from {updated} transcript(s).")
 
-    skipped = len(df) - updated
-    if skipped and not force:
-        print(f"Skipped {skipped} row(s) with existing transcript URLs. Use --force to refresh all.")
-    print(f"Extracted URLs from {updated} transcript(s).")
+        summary = db.get_pipeline_summary(playlist_name)
+        print(
+            f"\nURL extraction for '{playlist_name}': "
+            f"{summary.get('urls_done', 0)}/{summary.get('transcript_ok', 0)} transcripts processed"
+        )
+        maybe_export(db, playlist_name, export_path)
 
-    if output_path is None:
-        output_path = default_output_path(input_path, "TranscriptURLs")
-
-    write_playlist(df, output_path)
-    print(f"\nSuccess! Playlist with transcript URLs saved as: {output_path}")
-    return output_path
+    return playlist_name
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Extract websites and URLs mentioned in video transcripts."
+        description="Extract websites and URLs mentioned in database-stored video transcripts."
     )
-    parser.add_argument(
-        "--input",
-        "-i",
-        default=DEFAULT_INPUT,
-        help=f"Input playlist file with transcripts (default: {DEFAULT_INPUT})",
-    )
-    parser.add_argument(
-        "--output",
-        "-o",
-        default=None,
-        help="Output file (default: <input>_TranscriptURLs with same extension)",
-    )
+    add_playlist_args(parser, required=True)
     parser.add_argument(
         "--force",
         "-f",
         action="store_true",
-        help="Re-extract transcript URLs for all rows",
+        help="Re-extract transcript URLs for videos already processed",
     )
     parser.add_argument(
         "--exclude-youtube",
         action="store_true",
         help="Exclude youtube.com and youtu.be links from extracted URLs",
     )
-    parser.add_argument(
-        "--no-combined-column",
-        action="store_true",
-        help="Do not add the combined 'All URLs (description + transcript)' column",
-    )
+    add_db_args(parser)
+    parse_export_arg(parser)
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
 
-    if not os.path.isfile(args.input):
-        print(f"Input file not found: {args.input}")
-        sys.exit(1)
-
     try:
-        validate_playlist_paths(args.input, args.output)
         extract_transcript_urls(
-            args.input,
-            output_path=args.output,
+            args.playlist,
+            db_path=args.db,
             force=args.force,
             include_youtube=not args.exclude_youtube,
-            add_combined_column=not args.no_combined_column,
+            export_path=args.export,
         )
     except ValueError as exc:
         print(exc)

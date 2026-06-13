@@ -10,38 +10,14 @@ try:
     from googleapiclient.errors import HttpError
     import isodate
 except ImportError:
-    print(
-        "Please install required packages: "
-        "pip install -r requirements.txt"
-    )
+    print("Please install required packages: pip install -r requirements.txt")
     sys.exit(1)
 
-from playlist_utils import (
-    URLS_COLUMN,
-    default_output_path,
-    extract_urls,
-    get_video_id,
-    read_playlist,
-    require_video_url_column,
-    validate_playlist_paths,
-    write_playlist,
-)
+from pipeline_cli import add_db_args, add_playlist_args, maybe_export, open_db, parse_export_arg, validate_playlist_arg
+from playlist_utils import URLS_COLUMN, extract_urls
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
-DEFAULT_INPUT = "AL-ML Playlist.xlsx"
-ENRICHED_COLUMNS = [
-    "Channel Name",
-    "Channel ID",
-    "Publish Date",
-    "Video Length",
-    "View Count",
-    "Like Count",
-    "Comment Count",
-    "Full Video Description",
-    "Tags/Keywords",
-    URLS_COLUMN,
-]
 BATCH_SIZE = 50
 MAX_RETRIES = 5
 RETRY_BASE_DELAY_SEC = 2
@@ -60,11 +36,6 @@ def format_duration(raw_duration):
         return f"{minutes}:{seconds:02d}"
     except Exception:
         return raw_duration
-
-
-def row_is_enriched(row):
-    value = row.get("Channel Name", "")
-    return isinstance(value, str) and value.strip() != ""
 
 
 def execute_with_retry(request):
@@ -130,92 +101,57 @@ def fetch_metadata_for_ids(youtube, video_ids):
     return metadata_map
 
 
-def apply_metadata(df, metadata_map):
-    for column in ENRICHED_COLUMNS:
-        if column not in df.columns:
-            df[column] = ""
+def enrich_playlist_metadata(playlist_name, api_key, db_path=None, force=False, export_path=None):
+    validate_playlist_arg(playlist_name, required=True)
 
-    for idx, row in df.iterrows():
-        video_id = row.get("video_id")
-        if not video_id or video_id not in metadata_map:
-            continue
-        for column, value in metadata_map[video_id].items():
-            df.at[idx, column] = value
+    with open_db(db_path) as db:
+        if not db.get_playlist_by_name(playlist_name):
+            raise ValueError(f"Playlist not found in database: {playlist_name}")
 
+        videos = db.get_videos_needing_metadata(playlist_name=playlist_name, force=force)
+        if not videos:
+            print("No videos need metadata enrichment.")
+        else:
+            youtube = build("youtube", "v3", developerKey=api_key)
+            video_ids = [video["video_id"] for video in videos]
+            metadata_map = fetch_metadata_for_ids(youtube, video_ids)
 
-def fetch_youtube_metadata(input_path, api_key, output_path=None, force=False):
-    youtube = build("youtube", "v3", developerKey=api_key)
-    df = read_playlist(input_path)
-    require_video_url_column(df)
-    df["video_id"] = df["Video URL"].apply(get_video_id)
+            for video_id in video_ids:
+                if video_id in metadata_map:
+                    db.upsert_video_metadata(video_id, metadata_map[video_id])
 
-    invalid_urls = df[df["video_id"].isna()]
-    if not invalid_urls.empty:
-        print(f"\nWarning: {len(invalid_urls)} row(s) have unparseable Video URLs:")
-        for idx, row in invalid_urls.iterrows():
-            print(f"  Row {idx + 2}: {row['Video URL']}")
+            missing_ids = set(video_ids) - set(metadata_map.keys())
+            if missing_ids:
+                print(
+                    f"\nWarning: {len(missing_ids)} video(s) not returned by the API "
+                    "(deleted, private, or unavailable):"
+                )
+                for video_id in sorted(missing_ids):
+                    print(f"  {video_id}")
 
-    if force:
-        ids_to_fetch = df["video_id"].dropna().unique().tolist()
-        skipped = 0
-    else:
-        needs_fetch = ~df.apply(row_is_enriched, axis=1)
-        ids_to_fetch = df.loc[needs_fetch, "video_id"].dropna().unique().tolist()
-        skipped = len(df) - needs_fetch.sum()
+        summary = db.get_pipeline_summary(playlist_name)
+        print(
+            f"\nMetadata summary for '{playlist_name}': "
+            f"{summary.get('metadata_done', 0)}/{summary.get('total', 0)} complete"
+        )
+        maybe_export(db, playlist_name, export_path)
 
-    if skipped:
-        print(f"Skipping {skipped} already-enriched row(s). Use --force to refresh all.")
-
-    metadata_map = {}
-    if ids_to_fetch:
-        metadata_map = fetch_metadata_for_ids(youtube, ids_to_fetch)
-        apply_metadata(df, metadata_map)
-
-    requested_ids = set(ids_to_fetch)
-    missing_ids = requested_ids - set(metadata_map.keys())
-    if missing_ids:
-        print(f"\nWarning: {len(missing_ids)} video(s) not returned by the API "
-              "(deleted, private, or unavailable):")
-        for video_id in sorted(missing_ids):
-            matching_rows = df.index[df["video_id"] == video_id].tolist()
-            row_nums = ", ".join(str(i + 2) for i in matching_rows)
-            print(f"  {video_id} (rows {row_nums})")
-
-    df.drop(columns=["video_id"], inplace=True)
-
-    if output_path is None:
-        output_path = default_output_path(input_path, "Enriched")
-
-    write_playlist(df, output_path)
-    print(f"\nSuccess! Enriched playlist saved as: {output_path}")
-    return output_path
+    return playlist_name
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description=(
-            "Enrich a YouTube playlist file with metadata from the YouTube Data API. "
-            "Supports Excel (.xlsx) and CSV (.csv) files with comma or tab delimiters."
-        )
+        description="Enrich videos in a database playlist with YouTube Data API metadata."
     )
-    parser.add_argument(
-        "--input",
-        "-i",
-        default=DEFAULT_INPUT,
-        help=f"Input playlist file (.xlsx or .csv, default: {DEFAULT_INPUT})",
-    )
-    parser.add_argument(
-        "--output",
-        "-o",
-        default=None,
-        help="Output file (default: <input>_Enriched with same extension)",
-    )
+    add_playlist_args(parser, required=True)
     parser.add_argument(
         "--force",
         "-f",
         action="store_true",
-        help="Re-fetch metadata for all rows, even if already enriched",
+        help="Re-fetch metadata for videos that already have metadata",
     )
+    add_db_args(parser)
+    parse_export_arg(parser)
     return parser.parse_args()
 
 
@@ -230,17 +166,13 @@ if __name__ == "__main__":
         )
         sys.exit(1)
 
-    if not os.path.isfile(args.input):
-        print(f"Input file not found: {args.input}")
-        sys.exit(1)
-
     try:
-        validate_playlist_paths(args.input, args.output)
-        fetch_youtube_metadata(
-            args.input,
+        enrich_playlist_metadata(
+            args.playlist,
             api_key,
-            output_path=args.output,
+            db_path=args.db,
             force=args.force,
+            export_path=args.export,
         )
     except ValueError as exc:
         print(exc)

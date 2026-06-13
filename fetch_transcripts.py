@@ -2,7 +2,6 @@ import argparse
 import os
 import sys
 import time
-from pathlib import Path
 
 try:
     from youtube_transcript_api import YouTubeTranscriptApi
@@ -21,26 +20,10 @@ except ImportError:
     print("Please install required packages: pip install -r requirements.txt")
     sys.exit(1)
 
-from playlist_utils import (
-    TRANSCRIPT_COLUMN,
-    TRANSCRIPT_LANGUAGE_COLUMN,
-    TRANSCRIPT_STATUS_COLUMN,
-    cell_has_value,
-    default_output_path,
-    get_video_id,
-    read_playlist,
-    require_video_url_column,
-    validate_playlist_paths,
-    write_playlist,
-)
+from pipeline_cli import add_db_args, add_playlist_args, maybe_export, open_db, parse_export_arg, validate_playlist_arg
+from playlist_utils import TRANSCRIPT_COLUMN, TRANSCRIPT_LANGUAGE_COLUMN, TRANSCRIPT_STATUS_COLUMN
 
-DEFAULT_INPUT = "AL-ML Playlist_Enriched.xlsx"
 DEFAULT_LANGUAGES = ["en", "en-US", "en-GB"]
-TRANSCRIPT_COLUMNS = [
-    TRANSCRIPT_COLUMN,
-    TRANSCRIPT_LANGUAGE_COLUMN,
-    TRANSCRIPT_STATUS_COLUMN,
-]
 MAX_RETRIES = 3
 RETRY_BASE_DELAY_SEC = 2
 DEFAULT_DELAY_SEC = 2.5
@@ -62,10 +45,6 @@ def format_transcript_language(fetched):
     if fetched.is_generated:
         return f"{language} (auto-generated)"
     return language
-
-
-def row_has_transcript(row):
-    return cell_has_value(row.get(TRANSCRIPT_COLUMN, ""))
 
 
 def is_ip_block_error(exc):
@@ -132,134 +111,98 @@ def fetch_transcript_for_video(api, video_id, languages):
     return empty_result("error")
 
 
-def ensure_transcript_columns(df):
-    for column in TRANSCRIPT_COLUMNS:
-        if column not in df.columns:
-            df[column] = ""
-
-
-def apply_transcript_for_video(df, video_id, result):
-    ensure_transcript_columns(df)
-    mask = df["video_id"] == video_id
-    for idx in df.index[mask]:
-        for column, value in result.items():
-            df.at[idx, column] = value
-
-
-def load_playlist_for_run(input_path, output_path, force):
-    if not force and output_path and os.path.isfile(output_path):
-        print(f"Resuming from existing output file: {output_path}")
-        return read_playlist(output_path)
-    return read_playlist(input_path)
-
-
 def fetch_transcripts(
-    input_path,
-    output_path=None,
+    playlist_name,
+    db_path=None,
     force=False,
     languages=None,
     delay_sec=DEFAULT_DELAY_SEC,
     max_videos=None,
     stop_on_ip_block=True,
+    export_path=None,
 ):
+    validate_playlist_arg(playlist_name, required=True)
     languages = languages or DEFAULT_LANGUAGES
 
-    if output_path is None:
-        output_path = default_output_path(input_path, "Transcripts")
+    with open_db(db_path) as db:
+        if not db.get_playlist_by_name(playlist_name):
+            raise ValueError(f"Playlist not found in database: {playlist_name}")
 
-    df = load_playlist_for_run(input_path, output_path, force)
-    require_video_url_column(df)
-    df["video_id"] = df["Video URL"].apply(get_video_id)
-    ensure_transcript_columns(df)
+        videos = db.get_videos_needing_transcripts(playlist_name=playlist_name, force=force)
+        if max_videos is not None:
+            videos = videos[:max_videos]
 
-    if force:
-        ids_to_fetch = df["video_id"].dropna().unique().tolist()
-        skipped = 0
-    else:
-        needs_fetch = ~df.apply(row_has_transcript, axis=1)
-        ids_to_fetch = df.loc[needs_fetch, "video_id"].dropna().unique().tolist()
-        skipped = len(df) - needs_fetch.sum()
-
-    if max_videos is not None:
-        ids_to_fetch = ids_to_fetch[:max_videos]
-
-    if skipped:
-        print(f"Skipping {skipped} row(s) with existing transcripts. Use --force to refresh all.")
-
-    api = YouTubeTranscriptApi()
-    total = len(ids_to_fetch)
-    status_counts = {}
-    consecutive_ip_blocks = 0
-    stopped_early = False
-
-    print(f"Fetching transcripts for {total} unique videos...")
-    print(f"Saving progress to: {output_path}")
-
-    for index, video_id in enumerate(ids_to_fetch, start=1):
-        print(f"  [{index}/{total}] {video_id}")
-        result = fetch_transcript_for_video(api, video_id, languages)
-        apply_transcript_for_video(df, video_id, result)
-
-        status = result[TRANSCRIPT_STATUS_COLUMN]
-        status_counts[status] = status_counts.get(status, 0) + 1
-
-        df.drop(columns=["video_id"], inplace=True, errors="ignore")
-        write_playlist(df, output_path)
-        df["video_id"] = df["Video URL"].apply(get_video_id)
-
-        if status == "ip_blocked":
-            consecutive_ip_blocks += 1
-            if stop_on_ip_block and consecutive_ip_blocks >= CONSECUTIVE_IP_BLOCK_LIMIT:
-                print(
-                    f"\nStopping early after {consecutive_ip_blocks} consecutive IP rate-limit errors. "
-                    f"Progress saved to {output_path}. "
-                    f"Wait 30-60 minutes, then re-run the same command to resume."
-                )
-                stopped_early = True
-                break
+        if not videos:
+            print("No videos need transcript fetching.")
         else:
+            api = YouTubeTranscriptApi()
+            total = len(videos)
+            status_counts = {}
             consecutive_ip_blocks = 0
+            stopped_early = False
 
-        if index < total and delay_sec > 0:
-            time.sleep(delay_sec)
+            print(f"Fetching transcripts for {total} unique videos...")
+            for index, video in enumerate(videos, start=1):
+                video_id = video["video_id"]
+                print(f"  [{index}/{total}] {video_id}")
+                result = fetch_transcript_for_video(api, video_id, languages)
+                db.upsert_video_transcript(video_id, result)
 
-    if status_counts:
-        summary = ", ".join(f"{count} {status}" for status, count in sorted(status_counts.items()))
-        print(f"\nTranscript status summary: {summary}")
+                status = result[TRANSCRIPT_STATUS_COLUMN]
+                status_counts[status] = status_counts.get(status, 0) + 1
 
-    df.drop(columns=["video_id"], inplace=True, errors="ignore")
+                if status == "ip_blocked":
+                    consecutive_ip_blocks += 1
+                    if stop_on_ip_block and consecutive_ip_blocks >= CONSECUTIVE_IP_BLOCK_LIMIT:
+                        print(
+                            f"\nStopping early after {consecutive_ip_blocks} consecutive IP rate-limit errors. "
+                            "Progress saved to database. "
+                            "Wait 30-60 minutes, then re-run the same command to resume."
+                        )
+                        stopped_early = True
+                        break
+                else:
+                    consecutive_ip_blocks = 0
 
-    if stopped_early:
-        print(f"\nPartial results saved as: {output_path}")
-    else:
-        print(f"\nSuccess! Playlist with transcripts saved as: {output_path}")
-    return output_path
+                if index < total and delay_sec > 0:
+                    time.sleep(delay_sec)
+
+            if status_counts:
+                summary = ", ".join(
+                    f"{count} {status}" for status, count in sorted(status_counts.items())
+                )
+                print(f"\nTranscript status summary: {summary}")
+            if stopped_early:
+                print("Partial transcript results saved to database.")
+
+        summary = db.get_pipeline_summary(playlist_name)
+        print(
+            f"\nTranscript pipeline for '{playlist_name}': "
+            f"{summary.get('transcript_ok', 0)} ok, "
+            f"{summary.get('no_captions', 0)} no_captions, "
+            f"{summary.get('unavailable', 0)} unavailable, "
+            f"{summary.get('ip_blocked', 0)} ip_blocked, "
+            f"{summary.get('errors', 0)} error, "
+            f"{summary.get('transcript_pending', 0)} pending"
+        )
+        maybe_export(db, playlist_name, export_path)
+
+    return playlist_name
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Fetch YouTube video transcripts and add them to a playlist file. "
+            "Fetch YouTube video transcripts for videos in a database playlist. "
             "Uses youtube-transcript-api (no API key required)."
         )
     )
-    parser.add_argument(
-        "--input",
-        "-i",
-        default=DEFAULT_INPUT,
-        help=f"Input playlist file (.xlsx or .csv, default: {DEFAULT_INPUT})",
-    )
-    parser.add_argument(
-        "--output",
-        "-o",
-        default=None,
-        help="Output file (default: <input>_Transcripts with same extension)",
-    )
+    add_playlist_args(parser, required=True)
     parser.add_argument(
         "--force",
         "-f",
         action="store_true",
-        help="Re-fetch transcripts for all rows, even if already populated",
+        help="Re-fetch transcripts for videos previously marked ok",
     )
     parser.add_argument(
         "--language",
@@ -284,26 +227,24 @@ def parse_args():
         action="store_true",
         help="Keep going after IP rate-limit errors instead of stopping early",
     )
+    add_db_args(parser)
+    parse_export_arg(parser)
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
 
-    if not os.path.isfile(args.input):
-        print(f"Input file not found: {args.input}")
-        sys.exit(1)
-
     try:
-        validate_playlist_paths(args.input, args.output)
         fetch_transcripts(
-            args.input,
-            output_path=args.output,
+            args.playlist,
+            db_path=args.db,
             force=args.force,
             languages=parse_languages(args.language),
             delay_sec=args.delay,
             max_videos=args.max_videos,
             stop_on_ip_block=not args.continue_on_ip_block,
+            export_path=args.export,
         )
     except ValueError as exc:
         print(exc)
